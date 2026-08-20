@@ -2,14 +2,15 @@
 //!
 //! This module provides strict JCS canonicalization with duplicate-key rejection.
 //! It implements the transformation rules from RFC 8785 §2.1–§2.7:
-//! - Control characters escaped as `\uXXXX`
+//! - U+0000 through U+001F escaped per ECMAScript `JSON.stringify`
 //! - String escapes in deterministic order
 //! - Numbers with specific formatting rules
-//! - Object keys sorted lexicographically by JSON string codepoints
+//! - Object keys sorted lexicographically by UTF-16 code units
 
 use crate::error::JcsError;
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
-use std::collections::BTreeSet;
+use std::fmt;
 
 /// JCS canonicalizer that produces deterministic JSON bytes.
 #[derive(Debug, Clone, Default)]
@@ -47,7 +48,7 @@ impl Canonicalizer {
                 out.push_str(if *b { "true" } else { "false" });
             }
             Value::Number(n) => {
-                self.write_number(out, n);
+                self.write_number(out, n)?;
             }
             Value::String(s) => {
                 self.write_string(out, s);
@@ -58,10 +59,12 @@ impl Canonicalizer {
         Ok(())
     }
 
-    fn write_number(&self, out: &mut String, n: &Number) {
-        // RFC 8785 §2.3: Numbers are serialized without whitespace,
-        // using the shortest representation that preserves values.
-        out.push_str(&n.to_string());
+    fn write_number(&self, out: &mut String, n: &Number) -> Result<(), JcsError> {
+        let value = n.as_f64().ok_or_else(|| JcsError::InvalidJson {
+            reason: "number is outside the IEEE-754 binary64 JCS domain".into(),
+        })?;
+        out.push_str(ryu_js::Buffer::new().format_finite(value));
+        Ok(())
     }
 
     fn write_string(&self, out: &mut String, s: &str) {
@@ -75,8 +78,8 @@ impl Canonicalizer {
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
-                c if c.is_control() => {
-                    // RFC 8785 §2.2: Control characters → \uXXXX
+                c if c <= '\u{1f}' => {
+                    // RFC 8785 §3.2.2.2: ASCII controls use lowercase Unicode escapes.
                     out.push_str(&format!("\\u{:04x}", c as u32));
                 }
                 c => out.push(c),
@@ -100,21 +103,16 @@ impl Canonicalizer {
     }
 
     fn write_object(&self, out: &mut String, obj: &Map<String, Value>) -> Result<(), JcsError> {
-        // RFC 8785 §2.7: Object names (keys) MUST be sorted lexicographically by
-        // JSON string codepoints (UCS-2). BTreeMap gives us this ordering.
-        //
-        // We use a custom parser to detect duplicate keys (serde_json allows them).
+        // RFC 8785 §3.2.3: compare decoded property names as unsigned UTF-16
+        // code-unit sequences. Rust's native `str` order is UTF-8 and differs
+        // for supplementary-plane characters.
         out.push('{');
 
-        // Track seen keys to detect duplicates (RFC 8785 §2.7)
-        let mut seen_keys = BTreeSet::new();
         let mut first = true;
 
-        for (key, value) in obj.iter() {
-            if !seen_keys.insert(key.clone()) {
-                return Err(JcsError::DuplicateKey { key: key.clone() });
-            }
-
+        let mut entries: Vec<_> = obj.iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+        for (key, value) in entries {
             if !first {
                 out.push(',');
             }
@@ -138,118 +136,84 @@ impl Canonicalizer {
 /// NOTE: serde_json::from_str in non-strict mode silently accepts duplicates
 /// (keeps last value), so we MUST pre-validate the raw string before parsing.
 pub fn parse_with_dup_check(s: &str) -> Result<Value, JcsError> {
-    // Pre-check: scan raw string for duplicate keys at same nesting depth
-    // before letting serde_json silently pick one value
-    if let Some(dup) = find_duplicate_key(s) {
-        return Err(JcsError::DuplicateKey { key: dup });
-    }
-    let value: Value = serde_json::from_str(s).map_err(|e| JcsError::InvalidJson {
-        reason: e.to_string(),
+    let value: StrictValue = serde_json::from_str(s).map_err(|e| {
+        let reason = e.to_string();
+        if let Some(encoded_key) = reason
+            .strip_prefix("duplicate object key: ")
+            .and_then(|rest| rest.split(" at line ").next())
+        {
+            let key = serde_json::from_str(encoded_key)
+                .unwrap_or_else(|_| encoded_key.trim_matches('"').to_owned());
+            JcsError::DuplicateKey { key }
+        } else {
+            JcsError::InvalidJson { reason }
+        }
     })?;
-    Ok(value)
+    Ok(value.0)
 }
 
-/// Scans a raw JSON string for duplicate keys at the same nesting depth.
-///
-/// Returns the first duplicate key found, or None if the input is clean.
-/// Uses a (key_name, depth) HashMap so nested objects can reuse key names
-/// (e.g. `{"a": {"a": 1}}` is NOT a duplicate — different depths).
-///
-/// Required because `serde_json::from_str` silently accepts duplicates
-/// in non-strict mode (keeps last value).
-fn find_duplicate_key(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let n = bytes.len();
-    let mut i = 0;
-    let mut depth: usize = 0;
-    // Track (key_name, depth) → depth_of_first_occurrence
-    let mut seen: std::collections::HashMap<(String, usize), usize, _> =
-        std::collections::HashMap::new();
+struct StrictValue(Value);
 
-    while i < n {
-        match bytes[i] {
-            b'"' => {
-                // Beginning or end of a string at current position
-                let key_start = i + 1;
-                let key_end = skip_string(bytes, key_start, n);
-                let key = String::from_utf8_lossy(&bytes[key_start..key_end]).to_string();
-
-                // Advance cursor past the closing quote
-                i = key_end;
-
-                // Only treat this string as a key if followed by ':' at same depth
-                if is_key_at_depth(bytes, key_end, n) {
-                    let key_depth = depth;
-                    if let Some(&first_depth) = seen.get(&(key.clone(), key_depth)) {
-                        if first_depth == key_depth {
-                            return Some(key);
-                        }
-                    }
-                    seen.insert((key, key_depth), key_depth);
-                }
-            }
-            b'{' | b'[' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' | b']' => {
-                // depth can only go to 0 at most, never below
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictVisitor)
     }
-    None
 }
 
-/// Advance past a JSON string starting immediately after the opening '"'.
-/// Returns the index of the character AFTER the closing '"'.
-fn skip_string(bytes: &[u8], mut i: usize, n: usize) -> usize {
-    while i < n {
-        match bytes[i] {
-            b'"' => return i + 1, // position after closing quote
-            b'\\' => i += 2,      // skip escaped char
-            _ => i += 1,
-        }
+struct StrictVisitor;
+impl<'de> Visitor<'de> for StrictVisitor {
+    type Value = StrictValue;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
     }
-    n // unclosed string — fall off end
-}
-
-/// Returns true if the string starting at `pos` is followed by ':' at `depth`,
-/// with optional whitespace in between.
-fn is_key_at_depth(bytes: &[u8], pos: usize, n: usize) -> bool {
-    let mut j = pos;
-    // skip whitespace
-    while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
-    {
-        j += 1;
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Null))
     }
-    j < n && bytes[j] == b':'
-}
-fn detect_duplicates(value: &Value) -> Result<(), JcsError> {
-    match value {
-        Value::Object(map) => {
-            let mut keys = BTreeSet::new();
-            for key in map.keys() {
-                if !keys.insert(key.clone()) {
-                    return Err(JcsError::DuplicateKey { key: key.clone() });
-                }
-            }
-            for v in map.values() {
-                detect_duplicates(v)?;
-            }
-        }
-        Value::Array(arr) => {
-            for v in arr {
-                detect_duplicates(v)?;
-            }
-        }
-        _ => {}
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Bool(v)))
     }
-    Ok(())
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Number(v.into())))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Number(v.into())))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Number::from_f64(v)
+            .map(|n| StrictValue(Value::Number(n)))
+            .ok_or_else(|| E::custom("non-finite number"))
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        self.visit_string(v.into())
+    }
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::String(v)))
+    }
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Null))
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        StrictValue::deserialize(d)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element::<StrictValue>()? {
+            values.push(value.0);
+        }
+        Ok(StrictValue(Value::Array(values)))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut values = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate object key: {key:?}"
+                )));
+            }
+            values.insert(key, map.next_value::<StrictValue>()?.0);
+        }
+        Ok(StrictValue(Value::Object(values)))
+    }
 }
 
 /// Validates that a JSON string parses to JSON, resolving duplicates first.
@@ -257,9 +221,7 @@ fn detect_duplicates(value: &Value) -> Result<(), JcsError> {
 /// This is used for canonicalization inputs: the input need not be ordered,
 /// but duplicates MUST be rejected before canonicalization.
 pub fn parse_and_validate(input: &str) -> Result<Value, JcsError> {
-    let value = serde_json::from_str(input).map_err(JcsError::ParseError)?;
-    detect_duplicates(&value)?;
-    Ok(value)
+    parse_with_dup_check(input)
 }
 
 /// Canonicalize with automatic duplicate detection first.
@@ -267,7 +229,6 @@ pub fn parse_and_validate(input: &str) -> Result<Value, JcsError> {
 /// This canonicalizes any JSON (possibly with duplicate keys in the source),
 /// returning an error if duplicates are found.
 pub fn canonicalize_flexible(value: &Value) -> Result<String, JcsError> {
-    detect_duplicates(value)?;
     Canonicalizer::new().canonicalize(value)
 }
 
@@ -349,5 +310,129 @@ mod tests {
         let s = r#"{"outer": {"x": 1, "x": 2}}"#;
         let result = parse_with_dup_check(s);
         assert!(matches!(result, Err(JcsError::DuplicateKey { .. })));
+    }
+
+    // ===== RFC 8785 Appendix B conformance tests =====
+    // These test vectors are from RFC 8785 §3.2.2.2 (string escapes),
+    // §3.2.2.3 (number formatting), and the property-order examples.
+
+    #[test]
+    fn rfc8785_number_1e_minus_300() {
+        // RFC 8785 §3.2.2.3: 1e-300 → "1e-300" (not "1.0e-300")
+        let c = Canonicalizer::new();
+        let val: Value = serde_json::from_str("1e-300").unwrap();
+        assert_eq!(c.canonicalize(&val).unwrap(), "1e-300");
+    }
+
+    #[test]
+    fn rfc8785_number_100000000000000000000() {
+        // Large integer must stay as integer
+        let c = Canonicalizer::new();
+        let val: Value = serde_json::from_str("100000000000000000000").unwrap();
+        assert_eq!(c.canonicalize(&val).unwrap(), "100000000000000000000");
+    }
+
+    #[test]
+    fn rfc8785_number_negative_zero() {
+        // RFC 8785 §3.2.2.3: -0 → "-0" per ECMAScript JSON.stringify
+        // NOTE: serde_json::from_str("-0") normalizes to 0 (loses sign).
+        // This is a known serde_json limitation. A fully conformant JCS
+        // implementation would need a custom number parser to preserve -0.
+        // We document the gap rather than assert incorrect behavior.
+        let c = Canonicalizer::new();
+        let val: Value = serde_json::from_str("-0").unwrap();
+        let out = c.canonicalize(&val).unwrap();
+        // serde_json normalizes -0 to 0, so we get "0" not "-0"
+        assert_eq!(out, "0");
+    }
+
+    #[test]
+    fn rfc8785_number_3_1415() {
+        // Simple decimal
+        let c = Canonicalizer::new();
+        let val: Value = serde_json::from_str("3.1415").unwrap();
+        assert_eq!(c.canonicalize(&val).unwrap(), "3.1415");
+    }
+
+    #[test]
+    fn rfc8785_number_1e_plus30() {
+        // 1e30 → "1e+30" per ryu_js format
+        let c = Canonicalizer::new();
+        let val: Value = serde_json::from_str("1e30").unwrap();
+        let out = c.canonicalize(&val).unwrap();
+        assert!(
+            out.starts_with("1e"),
+            "expected exponential notation, got {out}"
+        );
+    }
+
+    #[test]
+    fn rfc8785_string_control_chars() {
+        // RFC 8785 §3.2.2.2: U+0000–U+001F must be \uXXXX
+        let c = Canonicalizer::new();
+        // Tab should be \t (allowed short escape), U+0001 should be \u0001
+        let val = json!("a\tb\u{0001}c");
+        let out = c.canonicalize(&val).unwrap();
+        assert!(out.contains("\\t"), "tab should be \\t: {out}");
+        assert!(out.contains("\\u0001"), "U+0001 should be \\u0001: {out}");
+    }
+
+    #[test]
+    fn rfc8785_string_delete_control() {
+        // U+007F (DEL) is NOT in U+0000-U+001F range — must be literal, not escaped
+        let c = Canonicalizer::new();
+        let val = json!("a\u{007f}b");
+        let out = c.canonicalize(&val).unwrap();
+        assert!(out.contains("\u{007f}"), "DEL should be literal: {out}");
+        assert!(!out.contains("\\u007f"), "DEL should not be escaped: {out}");
+    }
+
+    #[test]
+    fn rfc8785_property_order_utf16() {
+        // RFC 8785 §3.2.3: keys sorted by UTF-16 code units.
+        // "𝍢" (U+1D362) has UTF-16 code units [0xD834, 0xDF62].
+        // "Z" has UTF-16 code unit [0x005A].
+        // 0x005A < 0xD834, so "Z" must come before "𝍢".
+        let c = Canonicalizer::new();
+        let val = json!({"𝍢": 1, "Z": 2});
+        let out = c.canonicalize(&val).unwrap();
+        let z_pos = out.find("\"Z\"").unwrap();
+        let supplementary_pos = out.find("\"𝍢\"").unwrap();
+        assert!(z_pos < supplementary_pos, "Z must sort before 𝍢: {out}");
+    }
+
+    #[test]
+    fn rfc8785_property_order_a_vs_ab() {
+        // Shorter string that is a prefix of longer sorts first (UTF-16 comparison)
+        let c = Canonicalizer::new();
+        let val = json!({"ab": 1, "a": 2});
+        let out = c.canonicalize(&val).unwrap();
+        assert_eq!(out, r#"{"a":2,"ab":1}"#);
+    }
+
+    #[test]
+    fn rfc8785_nested_complex() {
+        // Complex nested structure with mixed types
+        let c = Canonicalizer::new();
+        let input = r#"{"b":1,"a":{"d":true,"c":null}}"#;
+        let val = parse_with_dup_check(input).unwrap();
+        let out = c.canonicalize(&val).unwrap();
+        assert_eq!(out, r#"{"a":{"c":null,"d":true},"b":1}"#);
+    }
+
+    #[test]
+    fn rfc8785_empty_containers() {
+        let c = Canonicalizer::new();
+        assert_eq!(c.canonicalize(&json!({})).unwrap(), "{}");
+        assert_eq!(c.canonicalize(&json!([])).unwrap(), "[]");
+    }
+
+    #[test]
+    fn rfc8785_unicode_escape_equivalence() {
+        // "\u0041" and "A" must produce the same canonical output
+        let c = Canonicalizer::new();
+        let a = parse_with_dup_check(r#""\u0041""#).unwrap();
+        let b = parse_with_dup_check(r#""A""#).unwrap();
+        assert_eq!(c.canonicalize(&a).unwrap(), c.canonicalize(&b).unwrap());
     }
 }

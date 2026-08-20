@@ -7,8 +7,8 @@
 //! - Canonicalizer that serializes JSON into deterministic byte sequences
 //! - Duplicate-key rejection (RFC 8785 mandates duplicate object keys are errors)
 //! - blake3 Content-Digest of the JCS string
-//! - Boundary profiles for dialect, schema ID+version, canonicalization profile, unknown-field policy, and resource ceilings
-//! - JSON Schema validation (stub — always passes)
+//! - Boundary profiles with enforced byte, node, depth, and container ceilings
+//! - Fail-closed schema admission when no validator/schema is configured
 //!
 //! # Integration
 //!
@@ -45,7 +45,12 @@ pub mod schema;
 pub use canonicalizer::{
     canonicalize_flexible, parse_and_validate, parse_with_dup_check, Canonicalizer,
 };
-pub use digest::ContentDigest;
+pub use digest::{
+    ContentDigest, DigestMetadata, CANONICALIZATION_PROFILE, CANONICAL_JSON_DOMAIN,
+    DEFAULT_SCHEMA_ID, DEFAULT_SCHEMA_VERSION, DIGEST_ALGORITHM,
+};
 pub use error::JcsError;
-pub use profile::BoundaryProfile;
+pub use profile::{
+    BoundaryAdmission, BoundaryEnforcementReceipt, BoundaryProfile, EnforcedRule, ResourceCeilings,
+};
 pub use schema::SchemaValidator;

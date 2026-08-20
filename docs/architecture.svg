@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" role="img" aria-labelledby="title desc">
+  <title id="title">boundary-compiler admission flow</title>
+  <desc id="desc">JSON input passes through duplicate-key rejection and resource budgets, then RFC 8785 canonicalization produces bytes, a digest, and an enforcement receipt.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1"><stop stop-color="#07111f"/><stop offset="1" stop-color="#111b31"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#62d7ff"/></marker>
+  </defs>
+  <rect width="1200" height="340" rx="24" fill="url(#bg)"/>
+  <g fill="none" stroke="#17304a" opacity=".5"> <path d="M0 70H1200M0 140H1200M0 210H1200M0 280H1200"/> <path d="M80 0V340M220 0V340M360 0V340M500 0V340M640 0V340M780 0V340M920 0V340M1060 0V340"/> </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">
+    <g filter="url(#glow)"><rect x="45" y="115" width="170" height="90" rx="14" fill="#162b4a" stroke="#62d7ff" stroke-width="2"/><text x="130" y="151" fill="#dff8ff" font-size="18">JSON input</text><text x="130" y="178" fill="#8aa7bf" font-size="13">UTF-8 bytes</text></g>
+    <g filter="url(#glow)"><rect x="275" y="90" width="205" height="140" rx="14" fill="#261c4b" stroke="#b38cff" stroke-width="2"/><text x="377" y="128" fill="#f0e9ff" font-size="17">Admission</text><text x="377" y="156" fill="#c6b5ef" font-size="13">duplicate keys</text><text x="377" y="178" fill="#c6b5ef" font-size="13">resource ceilings</text><text x="377" y="200" fill="#c6b5ef" font-size="13">fail closed</text></g>
+    <g filter="url(#glow)"><rect x="540" y="115" width="170" height="90" rx="14" fill="#103d3d" stroke="#63e6be" stroke-width="2"/><text x="625" y="151" fill="#e1fff5" font-size="18">RFC 8785</text><text x="625" y="178" fill="#9ce8d0" font-size="13">canonical bytes</text></g>
+    <g filter="url(#glow)"><rect x="770" y="90" width="175" height="140" rx="14" fill="#493117" stroke="#ffc266" stroke-width="2"/><text x="857" y="128" fill="#fff3dd" font-size="17">Evidence</text><text x="857" y="158" fill="#f2c98e" font-size="13">ContentDigest</text><text x="857" y="180" fill="#f2c98e" font-size="13">enforced rules</text><text x="857" y="202" fill="#f2c98e" font-size="13">receipt</text></g>
+    <g filter="url(#glow)"><rect x="1005" y="115" width="150" height="90" rx="14" fill="#162b4a" stroke="#62d7ff" stroke-width="2"/><text x="1080" y="151" fill="#dff8ff" font-size="17">Downstream</text><text x="1080" y="178" fill="#8aa7bf" font-size="13">store / sign /</text><text x="1080" y="196" fill="#8aa7bf" font-size="13">export safely</text></g>
+  </g>
+  <g stroke="#62d7ff" stroke-width="3" marker-end="url(#arrow)"><path d="M215 160H270"/><path d="M480 160H535"/><path d="M710 160H765"/><path d="M945 160H1000"/></g>
+  <text x="600" y="310" fill="#8aa7bf" font-family="ui-monospace, monospace" font-size="14" text-anchor="middle">one executable boundary contract • no schema engine is bundled</text>
+</svg>

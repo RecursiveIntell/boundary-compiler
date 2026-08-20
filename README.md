@@ -1,203 +1,135 @@
 # boundary-compiler
 
-RFC 8785 JSON Canonicalization Scheme (JCS) for Rust, with strict
-duplicate-key rejection and a content-hash primitive. Extracted from
-[`semantic-memory`](../semantic-memory) as part of the V30 hostile
-audit so that JCS is a reusable, audited, dependency-free crate.
+<!-- last-verified: 2026-08-20 -->
 
-This crate is the canonicalization layer for the entire
-RecursiveIntell memory stack: every receipt, every projection import,
-and every export envelope flows through `boundary-compiler`'s
-`Canonicalizer` and is identified by its `ContentDigest`.
+RFC 8785 JSON Canonicalization Scheme (JCS) for Rust, with strict duplicate-key rejection, executable resource ceilings, and content-digest metadata.
 
-## Why a separate JCS crate?
+![JSON input flows through duplicate-key checks and resource budgets into RFC 8785 canonical bytes, a digest, and an enforcement receipt.](https://raw.githubusercontent.com/RecursiveIntell/boundary-compiler/main/docs/architecture.svg)
 
-RFC 8785 has subtle gotchas — number formatting (no `+` prefix, no
-leading zeros, no `.0` for integers), string escaping (the surrogate
-range is forbidden), and the mandate that duplicate object keys are
-an error (not "last wins"). Most JSON canonicalization in the wild
-either (a) does it wrong, or (b) is buried inside a larger crate that
-you can't reuse.
+`boundary-compiler` is a small boundary-admission layer. It turns JSON input into deterministic RFC 8785 bytes only after duplicate-key and resource-budget checks pass. The result can carry a `ContentDigest` and a receipt describing which rules were enforced.
 
-`boundary-compiler` is the small, correct, reusable version. It
-depends on `blake3`, `serde`, `serde_json`, `sha2`, and `thiserror`.
-No async, no platform-specific code, no FFI. Builds in 2 seconds.
+## What it provides
 
-## Quick Start
+- **RFC 8785 canonicalization** through `Canonicalizer`.
+- **Strict parsing** through `parse_with_dup_check` and `parse_and_validate`; duplicate object keys fail instead of using “last value wins” behavior.
+- **Content binding** through `ContentDigest`, computed from canonical JSON bytes.
+- **Executable admission profiles** through `BoundaryProfile`, with input-byte, node, depth, object-key, string-byte, and array-length ceilings.
+- **Enforcement receipts** through `BoundaryAdmission::receipt`, including the canonicalization profile and applied rules.
+- **Fail-closed schema behavior** through `SchemaValidator` when no schema engine is configured in this base crate.
+
+## Scope and limits
+
+This crate supports one canonicalization contract: RFC 8785. It does **not** bundle a JSON Schema engine, choose an unknown-field policy, or claim that canonicalization alone validates a domain schema. Applications that need schema identity or field admission should run a configured schema layer before treating a value as domain-valid.
+
+The resource profile is a boundary guard, not a security certification. Select ceilings for the workload, keep normal error handling, and retain the receipt if downstream systems need to explain an admission decision.
+
+## Installation
+
+```toml
+[dependencies]
+boundary-compiler = "0.1.1"
+```
+
+Rust 1.75 or newer is required by the package manifest.
+
+## Quick start
 
 ```rust
-use boundary_compiler::{Canonicalizer, ContentDigest, BoundaryProfile};
-use serde_json::json;
+use boundary_compiler::{BoundaryProfile, ResourceCeilings};
 
-fn main() {
-    // RFC 8785 canonicalization — sorted keys, strict number formatting.
-    let c = Canonicalizer::new();
-    let val = json!({"b": 2, "a": 1});
-    let canonical = c.canonicalize(&val).unwrap();
-    assert_eq!(canonical, r#"{"a":1,"b":2}"#);
+fn main() -> Result<(), boundary_compiler::JcsError> {
+    let profile = BoundaryProfile::new(ResourceCeilings {
+        max_input_bytes: 1 << 20,
+        max_nodes: 100_000,
+        max_depth: 32,
+        max_object_keys: 128,
+        max_string_bytes: 1 << 20,
+        max_array_len: 1024,
+    });
 
-    // blake3 content digest of the JCS bytes — what you hash for receipts.
-    let digest = ContentDigest::compute(&val).unwrap();
-    println!("JCS digest: {}", digest);
+    let admitted = profile.parse(r#"{"b":2,"a":1}"#)?;
+    assert_eq!(admitted.canonical_bytes, br#"{"a":1,"b":2}"#);
+    assert_eq!(admitted.receipt.canonicalization_profile, "rfc8785");
+    Ok(())
 }
 ```
 
-Run it: `cargo run --example quick_start` (see `examples/`).
+For an already parsed `serde_json::Value`, use `Canonicalizer` or `canonicalize_flexible` directly. Use `ContentDigest::compute` when you need a digest for canonicalized content.
 
-## What you get
+## API map
 
-### Core API
+| API | Purpose |
+|---|---|
+| `Canonicalizer` | Serialize a `serde_json::Value` into deterministic RFC 8785 JSON. |
+| `parse_with_dup_check` | Parse JSON while rejecting decoded duplicate object keys. |
+| `parse_and_validate` | Convenience parse-and-check entry point. |
+| `canonicalize_flexible` | Canonicalize an in-memory JSON value. |
+| `ContentDigest` | Bind a value to its canonical representation with a content digest. |
+| `BoundaryProfile::new` / `rfc8785` | Construct an explicit or default admission profile. |
+| `BoundaryProfile::parse` | Check input budgets, reject duplicates, canonicalize, and return an admission receipt. |
+| `BoundaryProfile::check_resources` | Check a parsed value against structural budgets. |
+| `BoundaryEnforcementReceipt` | Record the canonicalization profile and enforced rules. |
+| `SchemaValidator` | Fail-closed schema boundary when no validator is configured. |
+| `JcsError` | Typed errors for parse, duplicate-key, digest, schema, profile, and resource failures. |
 
-- `Canonicalizer::new()` — construct a canonicalizer with the default
-  RFC 8785 settings.
-- `canonicalize(&Value) -> Result<String, JcsError>` — full RFC 8785
-  canonicalization. Sorted object keys, RFC 8785 number formatting
-  (no `+`, no leading zeros, integers as integers, floats with full
-  precision), RFC 8789 string escaping (the surrogate range is
-  forbidden), no insignificant whitespace.
-- `parse_with_dup_check(&str) -> Result<Value, JcsError>` — strict
-  JSON parser that rejects duplicate object keys (RFC 8785 §3.2.2.2).
-  Returns `JcsError::DuplicateKey { key, line, column }` on conflict.
-- `parse_and_validate(&str) -> Result<Value, JcsError>` — parse +
-  duplicate detection in one call.
-- `canonicalize_flexible(&Value) -> Result<String, JcsError>` —
-  convenience for "value is already in memory, just canonicalize."
-- `ContentDigest::compute(&Value) -> Result<ContentDigest, JcsError>` —
-  blake3 hash of the JCS bytes. The single handle a downstream
-  receipt needs to verify content integrity.
+## Resource ceilings
 
-### Boundary profiles
+`ResourceCeilings` defaults to the following limits:
 
-A `BoundaryProfile` is a configuration bundle that names the
-canonicalization dialect, the schema id + version, the
-canonicalization profile, the unknown-field policy, and the resource
-ceilings. It travels with the canonicalized value as a typed
-contract — not a free-form string.
+| Rule | Default |
+|---|---:|
+| `max_input_bytes` | 1 MiB |
+| `max_nodes` | 100,000 |
+| `max_depth` | 32 |
+| `max_object_keys` | 128 |
+| `max_string_bytes` | 1 MiB |
+| `max_array_len` | 1,024 |
 
-```rust
-use boundary_compiler::{
-    BoundaryProfile, CanonicalizationProfile, Dialect, ResourceCeilings,
-    SchemaValidator, UnknownFieldPolicy,
-};
+Provide a tighter or wider profile explicitly when those defaults do not match the surrounding service. A limit violation returns `JcsError::ResourceCeilingExceeded` before the admission succeeds.
 
-let profile = BoundaryProfile::builder()
-    .dialect(Dialect::StrictJSON)
-    .canonicalization(CanonicalizationProfile::Rfc8785)
-    .unknown_fields(UnknownFieldPolicy::Reject)
-    .resource_ceilings(ResourceCeilings {
-        max_depth: 32,
-        max_keys: 10_000,
-        max_value_bytes: 1_048_576, // 1 MB
-    })
-    .schema_id("https://schemas.example.com/claim-v1")
-    .schema_version("1.0.0")
-    .build();
+## Error behavior
+
+Fallible operations return `Result<_, JcsError>`. Important variants include:
+
+- `DuplicateKey { key }` — a decoded object key appeared more than once.
+- `ParseError(_)` — the input is not valid JSON.
+- `InvalidJson { reason }` — a value cannot be canonicalized under the supported contract.
+- `ResourceCeilingExceeded { resource, used, limit }` — an admission budget was exceeded.
+- `SchemaValidation(_)` / `SchemaError(_)` — schema admission failed or is not configured.
+- `DigestError(_)` — content-digest construction failed.
+
+## Verification
+
+The release-source checkout was verified on 2026-08-20 with:
+
+```bash
+cargo fmt --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
-`UnknownFieldPolicy::Reject` is the strict mode — values with
-fields not in the declared schema are rejected. `Strip` removes
-them silently. `Accept` allows them.
+The test suite covers RFC 8785 vectors, duplicate keys, number and string handling, profile enforcement, resource ceilings, digest behavior, and fail-closed schema admission. Run the commands above in your checkout for current evidence; this README does not substitute for a local gate.
 
-`ResourceCeilings` is a DoS guard. The default profile is 32 levels
-deep and 10,000 keys per object, which is enough for any normal
-payload but not for an adversarial one. Tighten it for your context.
+## Integration path
 
-### Schema validation
+`boundary-compiler` can sit between an untrusted JSON boundary and a receipt, persistence, or signing layer:
 
-`SchemaValidator` is currently a pass-through with the validation
-result struct in place. The actual JSON Schema validator (via
-`jsonschema` crate) is wired in via a future `schema-validation`
-feature flag. For now, use the boundary profile's
-`UnknownFieldPolicy` to reject non-conforming payloads, and use
-`semantic-memory` (which depends on this crate) if you need full
-JSON Schema validation.
+1. Parse with duplicate-key rejection.
+2. Apply a workload-specific `BoundaryProfile`.
+3. Persist or transmit `canonical_bytes` rather than an arbitrary serialization.
+4. Carry `ContentDigest` and the enforcement receipt with the downstream record.
+5. Apply domain schema validation separately when the application has a schema engine.
 
-## Error handling
+The crate is used as a foundational boundary primitive in the RecursiveIntell stack, including [`semantic-memory`](https://github.com/RecursiveIntell/semantic-memory). The links are absolute so they remain usable on crates.io as well as GitHub.
 
-All fallible operations return `Result<_, JcsError>`. There is
-**no `unwrap()` or `expect()` in production code** (verified by
-clippy with `-D warnings`). Errors are:
+## Repository and release artifacts
 
-- `JcsError::DuplicateKey { key, line, column }` — the input JSON
-  has two object members with the same key.
-- `JcsError::InvalidJson(String)` — the input JSON is malformed
-  (after the strict parser sees it).
-- `JcsError::NumberOutOfRange(String)` — the value contains a
-  number outside the JSON spec (NaN, Infinity, etc.).
-- `JcsError::SchemaValidation(String)` — a `BoundaryProfile`
-  check failed.
-- `JcsError::ResourceExceeded(String)` — a `ResourceCeilings`
-  limit was hit.
-
-## Test coverage
-
-- **27 integration tests** in `tests/`:
-  - RFC 8785 key sorting (single object, nested, mixed with arrays)
-  - Duplicate-key rejection (single, nested, with arrays)
-  - Number formatting (integers, negative, scientific, large floats,
-    `0.0`, `-0.0`, `1e1000`)
-  - String escaping (control chars, surrogate range, basic unicode)
-  - Round-trip determinism (canonicalize 1000 random values, verify
-    bit-exact output)
-  - Boundary profile behavior (Reject vs Strip vs Accept)
-  - Resource ceiling enforcement (depth, key count, value size)
-- **5 doctests** in the lib.rs doc-comment.
-- `cargo test` clean, `cargo clippy --all-targets -- -D warnings` clean.
-
-## Performance
-
-The canonicalizer is O(n) in the JSON value size, with the constant
-dominated by the sorted-key pass. For typical payloads (≤10 KB):
-
-- `canonicalize` of a 1 KB object: ~10 µs
-- `ContentDigest::compute` of a 1 KB object: ~15 µs
-- Round-trip 1000 canonicalizations of 1 KB objects: ~25 ms
-
-Numbers measured on a Fedora 43 dev box with `cargo bench`
-(included as `benches/canonicalize.rs`).
-
-## MSRV
-
-Rust 1.75 (2021 edition). The crate uses only stable features.
-
-## Dependencies
-
-- `blake3` — for `ContentDigest`. The single hash function used.
-- `serde` / `serde_json` — for the strict JSON parser and value
-  traversal.
-- `sha2` — kept in the dep tree for cross-crate compatibility
-  with the wider Libraries stack (semantic-memory, bitemporal-runtime
-  both use sha2 for digest).
-- `thiserror` — for the `JcsError` enum.
-
-Zero platform-specific code. Zero FFI. Zero async. Builds in ~2s.
+- Source: <https://github.com/RecursiveIntell/boundary-compiler>
+- API documentation: <https://docs.rs/boundary-compiler>
+- Changelog: [`CHANGELOG.md`](https://github.com/RecursiveIntell/boundary-compiler/blob/main/CHANGELOG.md)
+- License: [`LICENSE-APACHE`](https://github.com/RecursiveIntell/boundary-compiler/blob/main/LICENSE-APACHE) and [`LICENSE-MIT`](https://github.com/RecursiveIntell/boundary-compiler/blob/main/LICENSE-MIT)
 
 ## License
 
-Apache-2.0 (single-licensed). See `LICENSE-APACHE` for the full text.
-The MIT license (`LICENSE-MIT`) is also provided for downstream
-projects that need a permissive license, but the canonical license
-of this crate is Apache-2.0.
-
-## Changelog
-
-See `CHANGELOG.md` for the release history.
-
-## Where it's used
-
-`boundary-compiler` is a foundational layer of:
-
-- [`semantic-memory`](../semantic-memory) — every receipt, every
-  projection import, and every export envelope is JCS-canonicalized
-  and content-hashed by this crate.
-- [`bitemporal-runtime`](../bitemporal-runtime) — the
-  `SupersessionReceipt` digest uses `boundary_compiler::ContentDigest`
-  for the value-binding hash (added in the V31 hostile audit fix).
-- [`forge-memory-bridge`](../forge-memory-bridge) — the bridge
-  from Forge export envelopes to projection import batches
-  canonicalizes every envelope via this crate.
-
-Any system that needs deterministic JSON canonicalization (signed
-manifests, content-addressed dedup, cross-language interop) can
-adopt `boundary-compiler` directly without pulling in the rest of
-the stack.
+Apache-2.0. The repository also carries the MIT text for downstream compatibility; consult the checked-in license files for the governing terms.
