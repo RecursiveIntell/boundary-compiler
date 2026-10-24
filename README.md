@@ -76,14 +76,14 @@ For an already parsed `serde_json::Value`, use `Canonicalizer` or `canonicalize_
 
 `ResourceCeilings` defaults to the following limits:
 
-| Rule | Default |
-|---|---:|
-| `max_input_bytes` | 1 MiB |
-| `max_nodes` | 100,000 |
-| `max_depth` | 32 |
-| `max_object_keys` | 128 |
-| `max_string_bytes` | 1 MiB |
-| `max_array_len` | 1,024 |
+| Rule | Default | Applies to |
+|---|---:|---|
+| `max_input_bytes` | 1 MiB | UTF-8 input before parsing |
+| `max_nodes` | 100,000 | Total JSON values, including the root |
+| `max_depth` | 32 | Maximum depth of any JSON value; the root is depth 0 |
+| `max_object_keys` | 128 | Properties in each object |
+| `max_string_bytes` | 1 MiB | Each property name or string value |
+| `max_array_len` | 1,024 | Elements in each array |
 
 Provide a tighter or wider profile explicitly when those defaults do not match the surrounding service. A limit violation returns `JcsError::ResourceCeilingExceeded` before the admission succeeds.
 
