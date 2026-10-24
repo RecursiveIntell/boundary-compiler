@@ -80,7 +80,7 @@ For an already parsed `serde_json::Value`, use `Canonicalizer` or `canonicalize_
 |---|---:|---|
 | `max_input_bytes` | 1 MiB | UTF-8 input before parsing |
 | `max_nodes` | 100,000 | Total JSON values, including the root |
-| `max_depth` | 32 | Nested containers; the root is depth 0 |
+| `max_depth` | 32 | Maximum depth of any JSON value; the root is depth 0 |
 | `max_object_keys` | 128 | Properties in each object |
 | `max_string_bytes` | 1 MiB | Each property name or string value |
 | `max_array_len` | 1,024 | Elements in each array |
